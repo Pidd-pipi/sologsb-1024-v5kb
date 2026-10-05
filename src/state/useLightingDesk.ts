@@ -1,5 +1,6 @@
 import { useReducer } from 'react';
 import { recalculatePlans, samplePlans } from '../data';
+import { syncReconciliation } from '../reconciliation';
 import type { Cue, EditorState, LightingPlan, Scene, UserRole, Workspace } from '../types';
 
 export const LIGHTING_STORAGE_KEY = 'sologsb-1024/lighting-cue-desk/v1';
@@ -16,7 +17,8 @@ export function createInitialWorkspace(): Workspace {
     comparePlanId: plans[1].id,
     selectedSceneId: plans[0].scenes[0].id,
     selectedCueId: plans[0].scenes[0].cues[0].id,
-    role: 'designer'
+    role: 'designer',
+    reconciliation: { plans: {} }
   };
 }
 
@@ -32,6 +34,7 @@ export function createInitialState(): EditorState {
 export type EditorAction =
   | { type: 'hydrate'; workspace: Workspace }
   | { type: 'commit'; label: string; mutate: (workspace: Workspace) => void }
+  | { type: 'commitResult'; label: string; next: Workspace }
   | { type: 'selectScene'; sceneId: string }
   | { type: 'selectCue'; sceneId: string; cueId: string }
   | { type: 'selectPlan'; planId: string }
@@ -41,7 +44,11 @@ export type EditorAction =
   | { type: 'redo' };
 
 function normalizeWorkspace(workspace: Workspace) {
+  if (!workspace.reconciliation || !workspace.reconciliation.plans) {
+    workspace.reconciliation = { plans: {} };
+  }
   recalculatePlans(workspace.plans);
+  syncReconciliation(workspace, new Date().toISOString());
   const active = workspace.plans.find((plan) => plan.id === workspace.activePlanId) ?? workspace.plans[0];
   if (!active) return workspace;
   workspace.activePlanId = active.id;
@@ -70,6 +77,19 @@ export function lightingReducer(state: EditorState, action: EditorAction): Edito
       const next = clone(state.workspace);
       action.mutate(next);
       normalizeWorkspace(next);
+      const active = next.plans.find((plan) => plan.id === next.activePlanId);
+      if (active) active.updatedAt = new Date().toISOString();
+      return {
+        workspace: next,
+        past: [...state.past.slice(-49), clone(state.workspace)],
+        future: [],
+        lastAction: action.label
+      };
+    }
+    case 'commitResult': {
+      // 对账操作为“先克隆再合并”：只有合并成功才会带着克隆到达这里，
+      // 合并过程中抛出错误则调用方不会派发，原方案与待处理清单保持不变。
+      const next = normalizeWorkspace(clone(action.next));
       const active = next.plans.find((plan) => plan.id === next.activePlanId);
       if (active) active.updatedAt = new Date().toISOString();
       return {

@@ -56,11 +56,10 @@ import { CSS } from '@dnd-kit/utilities';
 import {
   AlertCircle,
   ArrowDown,
-  ArrowUp,
   CheckCircle2,
   ChevronRight,
   CircleDot,
-  Clock3,
+  ClipboardList,
   Copy,
   GripVertical,
   Lightbulb,
@@ -87,6 +86,18 @@ import {
   statusLabels
 } from './data';
 import {
+  ReconciliationError,
+  buildReconciliationExport,
+  buildSampleBatch,
+  confirmEntry,
+  discardEntry,
+  getPlanEntries,
+  mergeGoLog,
+  parseGoLog,
+  recalibrateEntry,
+  resolveEntry
+} from './reconciliation';
+import {
   LIGHTING_STORAGE_KEY,
   canEditScene,
   canFreeze,
@@ -96,7 +107,16 @@ import {
   formatTime,
   useLightingDesk
 } from './state/useLightingDesk';
-import type { Cue, CueConflict, LightingPlan, Scene, UserRole, Workspace } from './types';
+import type {
+  Cue,
+  CueConflict,
+  LightingPlan,
+  ReconciliationStatus,
+  Scene,
+  UserRole,
+  Workspace
+} from './types';
+import { EntryCard, ReconciliationPanel, type ResolvedEntryView } from './ReconciliationPanel';
 
 const statusColors = {
   draft: 'orange',
@@ -120,10 +140,11 @@ interface SortableCueRowProps {
   selected: boolean;
   disabled: boolean;
   conflicts: CueConflict[];
+  reconciliationStatus?: ReconciliationStatus;
   onSelect: () => void;
 }
 
-function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }: SortableCueRowProps) {
+function SortableCueRow({ cue, index, selected, disabled, conflicts, reconciliationStatus, onSelect }: SortableCueRowProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: cue.id,
     disabled
@@ -132,14 +153,23 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
     transform: CSS.Transform.toString(transform),
     transition
   };
+  const reconciliationDot = reconciliationStatus
+    ? {
+        pending: { color: '#63b3ed', label: '有待确认 GO 记录' },
+        'duplicate-pending': { color: '#f6ad55', label: '同一提示有多份不同 GO 记录，待舞台监督确认' },
+        'baseline-changed': { color: '#fc8181', label: '编号/顺序/渐变已变化，GO 记录失效待重算' },
+        confirmed: { color: '#68d391', label: '已有舞台监督确认的执行记录与计划快照' }
+      }[reconciliationStatus]
+    : undefined;
 
   return (
     <Box
       ref={setNodeRef}
+      id={`cue-${cue.id}`}
       style={style}
       role="option"
       aria-selected={selected}
-      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${conflicts.length} 个冲突`}
+      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${conflicts.length} 个冲突${reconciliationDot ? `，${reconciliationDot.label}` : ''}`}
       className={`cue-row ${selected ? 'active' : ''} ${isDragging ? 'dragging' : ''}`}
       borderBottomWidth="1px"
       borderColor="whiteAlpha.100"
@@ -171,6 +201,11 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
           <Flex align="center" gap={2}>
             <Text fontWeight="650" noOfLines={1}>{cue.label}</Text>
             {cue.followCueId ? <Tag size="sm" variant="subtle" colorScheme="purple">跟随</Tag> : null}
+            {reconciliationDot ? (
+              <Tooltip label={reconciliationDot.label}>
+                <ClipboardList size={14} color={reconciliationDot.color} aria-label={reconciliationDot.label} />
+              </Tooltip>
+            ) : null}
           </Flex>
           <Text color="whiteAlpha.500" fontSize="xs" noOfLines={1}>
             {cue.position} · {cue.channel} · {cue.color}
@@ -202,11 +237,12 @@ interface CueListProps {
   selectedCueId: string;
   canEdit: boolean;
   conflicts: CueConflict[];
+  cueReconciliation: Map<string, ReconciliationStatus>;
   onSelect: (cueId: string) => void;
   onReorder: (activeId: string, overId: string) => void;
 }
 
-function CueList({ scene, selectedCueId, canEdit, conflicts, onSelect, onReorder }: CueListProps) {
+function CueList({ scene, selectedCueId, canEdit, conflicts, cueReconciliation, onSelect, onReorder }: CueListProps) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -230,6 +266,7 @@ function CueList({ scene, selectedCueId, canEdit, conflicts, onSelect, onReorder
               selected={cue.id === selectedCueId}
               disabled={!canEdit}
               conflicts={conflicts.filter((item) => item.cueId === cue.id)}
+              reconciliationStatus={cueReconciliation.get(cue.number)}
               onSelect={() => onSelect(cue.id)}
             />
           ))}
@@ -566,6 +603,112 @@ function ComparePlan({
   );
 }
 
+function actorLabel(role: UserRole): string {
+  return roleLabels[role];
+}
+
+/** 把计划内全部对账记录解析为可渲染视图（差异、快照、确认状态）。 */
+function useResolvedEntries(workspace: Workspace, plan: LightingPlan) {
+  return useMemo(() => {
+    const nowIso = new Date().toISOString();
+    const entries = getPlanEntries(workspace, plan.id).map((entry) => {
+      const resolved = resolveEntry(entry, plan, nowIso);
+      const scene = resolved.scene;
+      const frozen = Boolean(scene?.frozen);
+      const plannedStart =
+        entry.status === 'confirmed'
+          ? entry.planSnapshot?.startTime ?? entry.baseline.startTime
+          : resolved.liveBaseline?.startTime ?? entry.baseline.startTime;
+      return {
+        entry,
+        cueMissing: !resolved.cue,
+        frozen,
+        sceneName: scene?.name ?? '（场次缺失）',
+        cueLabel: resolved.cue?.label ?? '',
+        sceneOrder: scene?.order ?? Number.MAX_SAFE_INTEGER,
+        orderIndex: resolved.orderIndex,
+        plannedStart,
+        confirmedRecordId: entry.confirmedRecordId,
+        diffs: resolved.diffs.map((item) => ({
+          recordId: item.record.id,
+          source: item.record.source,
+          firedAt: item.record.firedAt,
+          note: item.record.note,
+          importedAt: item.record.importedAt,
+          timeDelta: item.timeDelta,
+          timeFields: item.timeFields,
+          paramFields: item.paramFields,
+          changed: item.changed,
+          chosen: entry.confirmedRecordId === item.record.id,
+          appendedAfterConfirm: Boolean(entry.confirmedAt && item.record.importedAt > entry.confirmedAt)
+        }))
+      };
+    });
+    entries.sort((a, b) => a.sceneOrder - b.sceneOrder || a.orderIndex - b.orderIndex || a.entry.cueNumber.localeCompare(b.entry.cueNumber));
+    return entries;
+  }, [workspace, plan]);
+}
+
+function ReconciliationQueue({
+  workspace,
+  entries,
+  summary,
+  onConfirm,
+  onDiscard,
+  onRecalibrate,
+  onJumpScene
+}: {
+  workspace: Workspace;
+  entries: ResolvedEntryView[];
+  summary: { total: number; pending: number; duplicate: number; invalid: number; confirmed: number };
+  onConfirm: (entryId: string, recordId: string) => void;
+  onDiscard: (entryId: string) => void;
+  onRecalibrate: (entryId: string) => void;
+  onJumpScene: (sceneId: string, cueNumber: string) => void;
+}) {
+  return (
+    <VStack align="stretch" spacing={3}>
+      <SimpleGrid columns={2} spacing={2}>
+        <Box p={2} borderRadius="lg" bg="blackAlpha.200">
+          <Flex align="center" gap={1} color="orange.300"><ClipboardList size={14} /><Text fontWeight="800">{summary.duplicate + summary.invalid + summary.pending}</Text></Flex>
+          <Text color="whiteAlpha.500" fontSize="10px">待处理（{summary.duplicate} 冲突 · {summary.invalid} 失效）</Text>
+        </Box>
+        <Box p={2} borderRadius="lg" bg="blackAlpha.200">
+          <Flex align="center" gap={1} color="green.300"><CheckCircle2 size={14} /><Text fontWeight="800">{summary.confirmed}</Text></Flex>
+          <Text color="whiteAlpha.500" fontSize="10px">已确认（含计划快照）</Text>
+        </Box>
+      </SimpleGrid>
+      {workspace.role === 'stage-manager' ? (
+        <Text fontSize="11px" color="whiteAlpha.500">舞台监督队列：同一提示的多份 GO 记录在此并列，请核对差异后确认其一。确认前不会改动全剧时间。</Text>
+      ) : (
+        <Text fontSize="11px" color="whiteAlpha.500">编程执行只能补记录；确认操作请交由舞台监督。失效记录可由灯光设计/舞台监督按新计划重算。</Text>
+      )}
+      {!entries.length ? (
+        <Flex minH="200px" align="center" justify="center" color="green.300" textAlign="center">
+          <Box>
+            <CheckCircle2 size={32} style={{ margin: '0 auto 8px' }} />
+            <Text fontSize="sm">当前方案没有待处理的 GO 对账记录</Text>
+            <Text color="whiteAlpha.500" fontSize="11px">在中间“执行对账”卡片导入断网控台记录</Text>
+          </Box>
+        </Flex>
+      ) : (
+        entries.map((resolved) => (
+          <Box key={resolved.entry.id}>
+            <EntryCard
+              resolved={resolved}
+              role={workspace.role}
+              onSelectCue={() => onJumpScene(resolved.entry.sceneId, resolved.entry.cueNumber)}
+              onConfirm={onConfirm}
+              onDiscard={onDiscard}
+              onRecalibrate={onRecalibrate}
+            />
+          </Box>
+        ))
+      )}
+    </VStack>
+  );
+}
+
 export default function App() {
   const [state, dispatch] = useLightingDesk();
   const [hydrated, setHydrated] = useState(false);
@@ -586,6 +729,25 @@ export default function App() {
   const editable = canEditScene(workspace.role, activeScene);
   const freezer = canFreeze(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
+  const resolvedEntries = useResolvedEntries(workspace, activePlan);
+  const sceneEntries = resolvedEntries.filter((item) => item.entry.sceneId === activeScene?.id);
+  const pendingEntries = resolvedEntries.filter((item) => item.entry.status !== 'confirmed');
+  const reconciliationSummary = useMemo(
+    () => ({
+      total: resolvedEntries.length,
+      pending: resolvedEntries.filter((item) => item.entry.status === 'pending').length,
+      duplicate: resolvedEntries.filter((item) => item.entry.status === 'duplicate-pending').length,
+      invalid: resolvedEntries.filter((item) => item.entry.status === 'baseline-changed').length,
+      confirmed: resolvedEntries.filter((item) => item.entry.status === 'confirmed').length
+    }),
+    [resolvedEntries]
+  );
+  const cueNumbersPendingConfirm = new Set(
+    pendingEntries.map((item) => item.entry.cueNumber)
+  );
+  const cueNumberToStatus = new Map(
+    resolvedEntries.map((item) => [item.entry.cueNumber, item.entry.status] as const)
+  );
 
   useEffect(() => {
     try {
@@ -736,7 +898,8 @@ export default function App() {
       const scene = scenes[(startScene + index) % scenes.length];
       scene.cues.forEach((cue) => {
         const hasConflict = activeConflicts.some((item) => item.cueId === cue.id && item.severity === 'error');
-        if (cue.status !== 'confirmed' || hasConflict) all.push({ scene, cue });
+        const hasPendingGo = cueNumbersPendingConfirm.has(cue.number);
+        if (cue.status !== 'confirmed' || hasConflict || hasPendingGo) all.push({ scene, cue });
       });
     }
     const currentIndex = all.findIndex((item) => item.cue.id === selectedCue?.id);
@@ -800,17 +963,128 @@ export default function App() {
     dispatch({ type: 'selectCue', sceneId, cueId });
   }
 
+  function runGoMerge(records: Parameters<typeof mergeGoLog>[2], source: string) {
+    // 先在克隆上合并：mergeGoLog 抛错则放弃派发，原方案与待处理清单完全不变。
+    const draft = structuredClone(workspace);
+    try {
+      const report = mergeGoLog(draft, activePlan.id, records, source, new Date().toISOString());
+      dispatch({ type: 'commitResult', label: `合并 GO 记录（${source}）`, next: draft });
+      const description =
+        `新建对账 ${report.createdEntries} 条，合并 ${report.merged} 份` +
+        (report.appended ? `（其中 ${report.appended} 份与既有记录并列待确认）` : '') +
+        (report.duplicates ? `，重复跳过 ${report.duplicates} 份` : '') +
+        (report.rejected ? `，拒绝 ${report.rejected} 份` : '');
+      toast({
+        title: report.rejected ? 'GO 记录已部分合并' : 'GO 记录已合并进执行对账',
+        description: report.rejectedItems.length
+          ? `${description}；拒绝：${report.rejectedItems.map((item) => `${item.cue}（${item.reason}）`).join('；')}`
+          : description,
+        status: report.rejected ? 'warning' : 'success',
+        duration: 4200,
+        isClosable: true
+      });
+    } catch (error) {
+      const message = error instanceof ReconciliationError ? error.message : '合并失败，原方案与待处理清单保持不变。';
+      toast({ title: '合并失败，已恢复原方案与待处理清单', description: message, status: 'error', duration: 4200, isClosable: true });
+    }
+  }
+
+  function importGoFile(file: File) {
+    if (workspace.role !== 'designer' && workspace.role !== 'programmer') {
+      toast({ title: '当前角色不能补记录', description: '编程执行负责导入 GO 记录，舞台监督负责确认。', status: 'warning' });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const { records, source } = parseGoLog(String(reader.result ?? ''));
+        runGoMerge(records, source);
+      } catch (error) {
+        const message = error instanceof ReconciliationError ? error.message : 'GO 记录无法解析。';
+        toast({ title: '导入失败，原方案与待处理清单保持不变', description: message, status: 'error', duration: 4200, isClosable: true });
+      }
+    };
+    reader.onerror = () => {
+      toast({ title: '读取文件失败', description: '原方案与待处理清单保持不变。', status: 'error' });
+    };
+    reader.readAsText(file);
+  }
+
+  function loadSampleBatch(variant: 'first-show' | 'second-show') {
+    if (workspace.role !== 'designer' && workspace.role !== 'programmer') {
+      toast({ title: '当前角色不能补记录', description: '请切换到编程执行或灯光设计。', status: 'warning' });
+      return;
+    }
+    const { records, source } = buildSampleBatch(activePlan, variant);
+    runGoMerge(records, source);
+  }
+
+  function runReconciliationAction(label: string, run: (draft: Workspace) => void, success: string) {
+    const draft = structuredClone(workspace);
+    try {
+      run(draft);
+      dispatch({ type: 'commitResult', label, next: draft });
+      toast({ title: success, status: 'success', duration: 2200 });
+    } catch (error) {
+      const message = error instanceof ReconciliationError ? error.message : '操作失败，原方案与待处理清单保持不变。';
+      toast({ title: '操作未执行', description: message, status: 'error', duration: 3600, isClosable: true });
+    }
+  }
+
+  function confirmReconciliationEntry(entryId: string, recordId: string) {
+    runReconciliationAction(
+      '舞台监督确认 GO 对账记录',
+      (draft) => confirmEntry(draft, activePlan.id, entryId, recordId, draft.role, actorLabel(workspace.role), new Date().toISOString()),
+      '已确认并锁定当时计划快照，全剧时间未改动'
+    );
+  }
+
+  function discardReconciliationEntry(entryId: string) {
+    const entry = getPlanEntries(workspace, activePlan.id).find((item) => item.id === entryId);
+    if (!window.confirm(`废弃提示 ${entry?.cueNumber ?? ''} 的全部未确认 GO 记录？已确认快照不受影响。`)) return;
+    runReconciliationAction(
+      '废弃未确认 GO 记录',
+      (draft) => discardEntry(draft, activePlan.id, entryId, draft.role),
+      '未确认记录已废弃'
+    );
+  }
+
+  function recalibrateReconciliationEntry(entryId: string) {
+    runReconciliationAction(
+      '按新计划重算对账基线',
+      (draft) => recalibrateEntry(draft, activePlan.id, entryId, draft.role, new Date().toISOString()),
+      '已按当前编号、顺序与渐变时长重建基线'
+    );
+  }
+
+  function selectCueByNumber(cueNumber: string) {
+    if (!activeScene) return;
+    const cue = activeScene.cues.find((item) => item.number.trim() === cueNumber.trim());
+    if (cue) {
+      dispatch({ type: 'selectCue', sceneId: activeScene.id, cueId: cue.id });
+      window.setTimeout(() => document.getElementById(`cue-${cue.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50);
+    }
+  }
+
+  function selectCueByNumberInScene(sceneId: string, cueNumber: string) {
+    const plan = workspace.plans.find((item) => item.id === workspace.activePlanId);
+    const scene = plan?.scenes.find((item) => item.id === sceneId);
+    const cue = scene?.cues.find((item) => item.number.trim() === cueNumber.trim());
+    if (scene && cue) dispatch({ type: 'selectCue', sceneId: scene.id, cueId: cue.id });
+  }
+
   function exportPlan() {
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
       conflicts: activeConflicts,
+      reconciliation: buildReconciliationExport(workspace, activePlan.id, new Date().toISOString()),
       role: workspace.role
     };
     const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }));
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${activePlan.name}-灯光提示.json`;
+    anchor.download = `${activePlan.name}-灯光提示与执行对账.json`;
     anchor.click();
     URL.revokeObjectURL(url);
   }
@@ -949,9 +1223,21 @@ export default function App() {
                   <Text fontSize="2xl" fontWeight="800" color={activeConflicts.length ? 'orange.300' : 'green.300'}>{activeConflicts.length}</Text>
                   <Text color="whiteAlpha.500" fontSize="xs">当前方案冲突</Text>
                 </Box>
+                <Box p={3} borderRadius="lg" bg="blackAlpha.200" gridColumn="1 / -1">
+                  <Flex align="center" gap={2}>
+                    <ClipboardList size={18} color={reconciliationSummary.duplicate + reconciliationSummary.invalid + reconciliationSummary.pending ? '#f6ad55' : '#68d391'} />
+                    <Box>
+                      <Text fontSize="lg" fontWeight="800" lineHeight={1}>
+                        {reconciliationSummary.duplicate + reconciliationSummary.invalid + reconciliationSummary.pending}
+                        <Text as="span" fontSize="xs" color="whiteAlpha.500" fontWeight="500"> 待处理 / {reconciliationSummary.confirmed} 已确认</Text>
+                      </Text>
+                      <Text color="whiteAlpha.500" fontSize="xs">GO 执行对账</Text>
+                    </Box>
+                  </Flex>
+                </Box>
               </SimpleGrid>
               <Button mt={3} w="full" colorScheme="blue" variant="outline" leftIcon={<SkipForward size={16} />} onClick={jumpIncomplete}>
-                下一未完成 / 阻断项
+                下一未完成 / 阻断项 / 待对账
               </Button>
             </Box>
 
@@ -1044,8 +1330,22 @@ export default function App() {
                 selectedCueId={workspace.selectedCueId}
                 canEdit={editable}
                 conflicts={activeConflicts}
+                cueReconciliation={cueNumberToStatus}
                 onSelect={(cueId) => selectCue(activeScene.id, cueId)}
                 onReorder={reorderCue}
+              />
+
+              <ReconciliationPanel
+                workspace={workspace}
+                sceneId={activeScene.id}
+                entries={sceneEntries}
+                summary={reconciliationSummary}
+                onConfirm={confirmReconciliationEntry}
+                onDiscard={discardReconciliationEntry}
+                onRecalibrate={recalibrateReconciliationEntry}
+                onImportFile={importGoFile}
+                onLoadSample={loadSampleBatch}
+                onSelectCue={selectCueByNumber}
               />
 
               <Box borderWidth="1px" borderColor="whiteAlpha.100" borderRadius="xl" bg="whiteAlpha.50" p={4}>
@@ -1074,6 +1374,15 @@ export default function App() {
               <TabList px={3} pt={2}>
                 <Tab>提示编辑</Tab>
                 <Tab>冲突 <Badge ml={1} colorScheme={activeConflicts.length ? 'orange' : 'green'}>{activeConflicts.length}</Badge></Tab>
+                <Tab>
+                  对账
+                  <Badge
+                    ml={1}
+                    colorScheme={reconciliationSummary.pending + reconciliationSummary.duplicate + reconciliationSummary.invalid ? 'orange' : reconciliationSummary.confirmed ? 'green' : 'whiteAlpha'}
+                  >
+                    {reconciliationSummary.pending + reconciliationSummary.duplicate + reconciliationSummary.invalid}
+                  </Badge>
+                </Tab>
                 <Tab>关系图</Tab>
               </TabList>
               <TabPanels>
@@ -1096,6 +1405,20 @@ export default function App() {
                   <ConflictList
                     conflicts={activeConflicts}
                     onSelect={(sceneId, cueId) => selectCue(sceneId, cueId)}
+                  />
+                </TabPanel>
+                <TabPanel px={4} pb={5}>
+                  <ReconciliationQueue
+                    workspace={workspace}
+                    entries={pendingEntries}
+                    summary={reconciliationSummary}
+                    onConfirm={confirmReconciliationEntry}
+                    onDiscard={discardReconciliationEntry}
+                    onRecalibrate={recalibrateReconciliationEntry}
+                    onJumpScene={(sceneId, cueNumber) => {
+                      dispatch({ type: 'selectScene', sceneId });
+                      window.setTimeout(() => selectCueByNumberInScene(sceneId, cueNumber), 60);
+                    }}
                   />
                 </TabPanel>
                 <TabPanel px={4} pb={5}>
