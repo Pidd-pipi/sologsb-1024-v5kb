@@ -60,10 +60,12 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleDot,
+  ClipboardList,
   Clock3,
   Copy,
   GripVertical,
   Lightbulb,
+  ListChecks,
   Lock,
   LockOpen,
   Pause,
@@ -86,6 +88,16 @@ import {
   roleLabels,
   statusLabels
 } from './data';
+import ReconciliationPanel from './ReconciliationPanel';
+import { sampleGoLogRejected, sampleGoLogSuccess } from './goSamples';
+import {
+  confirmEntry,
+  discardEntry,
+  mergeGoRecords,
+  parseGoLog,
+  recalculateEntry,
+  selectPlanViews
+} from './reconciliation';
 import {
   LIGHTING_STORAGE_KEY,
   canEditScene,
@@ -96,7 +108,7 @@ import {
   formatTime,
   useLightingDesk
 } from './state/useLightingDesk';
-import type { Cue, CueConflict, LightingPlan, Scene, UserRole, Workspace } from './types';
+import type { Cue, CueConflict, GoRecord, ImportReport, LightingPlan, ReconciliationView, Scene, UserRole, Workspace } from './types';
 
 const statusColors = {
   draft: 'orange',
@@ -120,10 +132,11 @@ interface SortableCueRowProps {
   selected: boolean;
   disabled: boolean;
   conflicts: CueConflict[];
+  reconciliation?: ReconciliationView;
   onSelect: () => void;
 }
 
-function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }: SortableCueRowProps) {
+function SortableCueRow({ cue, index, selected, disabled, conflicts, reconciliation, onSelect }: SortableCueRowProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: cue.id,
     disabled
@@ -132,6 +145,27 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
     transform: CSS.Transform.toString(transform),
     transition
   };
+
+  const reconIndicator = reconciliation ? (
+    <Tooltip
+      label={
+        reconciliation.status === 'confirmed'
+          ? `执行记录已确认${reconciliation.snapshot ? `（${new Date(reconciliation.snapshot.capturedAt).toLocaleDateString('zh-CN')} 快照）` : ''}`
+          : reconciliation.effective === 'stale'
+            ? `执行记录失效：${reconciliation.staleReason ?? ''}`
+            : `${reconciliation.records.length} 份执行记录待舞台监督确认`
+      }
+    >
+      <Box
+        boxSize="9px"
+        borderRadius="full"
+        flexShrink={0}
+        bg={reconciliation.status === 'confirmed' ? 'green.400' : reconciliation.effective === 'stale' ? 'red.400' : 'orange.400'}
+        role="img"
+        aria-label={reconciliation.status === 'confirmed' ? '已确认执行记录' : reconciliation.effective === 'stale' ? '执行记录失效' : '执行记录待确认'}
+      />
+    </Tooltip>
+  ) : null;
 
   return (
     <Box
@@ -163,7 +197,10 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
           {(index + 1).toString().padStart(2, '0')}
         </Text>
         <Box w="84px">
-          <Text fontFamily="mono" fontWeight="700" color="amber.300">{cue.number}</Text>
+          <Flex align="center" gap={1}>
+            <Text fontFamily="mono" fontWeight="700" color="amber.300">{cue.number}</Text>
+            {reconIndicator}
+          </Flex>
           <Text color="whiteAlpha.500" fontSize="10px">{formatTime(cue.startTime)}</Text>
         </Box>
         <Box className="color-swatch" bg={cue.colorHex} boxSize="14px" flexShrink={0} />
@@ -202,11 +239,12 @@ interface CueListProps {
   selectedCueId: string;
   canEdit: boolean;
   conflicts: CueConflict[];
+  reconciliationByCue: Map<string, ReconciliationView>;
   onSelect: (cueId: string) => void;
   onReorder: (activeId: string, overId: string) => void;
 }
 
-function CueList({ scene, selectedCueId, canEdit, conflicts, onSelect, onReorder }: CueListProps) {
+function CueList({ scene, selectedCueId, canEdit, conflicts, reconciliationByCue, onSelect, onReorder }: CueListProps) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -230,6 +268,7 @@ function CueList({ scene, selectedCueId, canEdit, conflicts, onSelect, onReorder
               selected={cue.id === selectedCueId}
               disabled={!canEdit}
               conflicts={conflicts.filter((item) => item.cueId === cue.id)}
+              reconciliation={reconciliationByCue.get(cue.number)}
               onSelect={() => onSelect(cue.id)}
             />
           ))}
@@ -572,6 +611,7 @@ export default function App() {
   const [online, setOnline] = useState(true);
   const [savedAt, setSavedAt] = useState('');
   const [syncMessage, setSyncMessage] = useState('离线草稿待命');
+  const [mode, setMode] = useState<'design' | 'reconcile'>('design');
   const toast = useToast();
   const workspace = state.workspace;
   const activePlan = findActivePlan(workspace);
@@ -586,6 +626,17 @@ export default function App() {
   const editable = canEditScene(workspace.role, activeScene);
   const freezer = canFreeze(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
+  const reconciliationViews: ReconciliationView[] = useMemo(
+    () => selectPlanViews(workspace.reconciliation, workspace.plans, activePlan.id),
+    [workspace.reconciliation, workspace.plans, activePlan.id]
+  );
+  const reconciliationByCue = useMemo(() => {
+    const map = new Map<string, ReconciliationView>();
+    for (const view of reconciliationViews) {
+      if (view.sceneId === activeScene?.id) map.set(view.cueNumber, view);
+    }
+    return map;
+  }, [reconciliationViews, activeScene?.id]);
 
   useEffect(() => {
     try {
@@ -800,17 +851,157 @@ export default function App() {
     dispatch({ type: 'selectCue', sceneId, cueId });
   }
 
+  // ── 执行对账 ────────────────────────────────────────────────
+  function failImport(errors: string[]) {
+    const report: ImportReport = {
+      batchId: '',
+      imported: 0,
+      duplicated: 0,
+      merged: 0,
+      created: 0,
+      conflicts: 0,
+      rejected: errors,
+      restored: true
+    };
+    dispatch({
+      type: 'reconcile',
+      label: 'GO 记录合并失败，已恢复原方案和待处理清单',
+      reconciliation: workspace.reconciliation,
+      report
+    });
+    toast({ title: '合并失败，未写入任何记录', description: errors.join('；'), status: 'error', duration: 3200 });
+  }
+
+  function importGoRaw(raw: string) {
+    const content = raw === '__sample_success__'
+      ? sampleGoLogSuccess
+      : raw === '__sample_rejected__'
+        ? sampleGoLogRejected
+        : raw;
+    const parsed = parseGoLog(content, activePlan.id, activeScene?.id ?? activePlan.scenes[0]?.id ?? '');
+    if (parsed.errors.length || !parsed.records.length) {
+      failImport(parsed.errors.length ? parsed.errors : ['文件中没有可用的 GO 记录']);
+      return;
+    }
+    // 只在草稿上合并；mergeGoRecords 任一记录被拒即返回错误，当前 workspace 原样不动
+    const result = mergeGoRecords(workspace.reconciliation, workspace.plans, parsed.records);
+    if ('errors' in result) {
+      failImport(result.errors);
+      return;
+    }
+    const report: ImportReport = { ...result.report, restored: false };
+    dispatch({
+      type: 'reconcile',
+      label: `导入 GO 记录：合并 ${report.merged} 条，重复 ${report.duplicated} 条`,
+      reconciliation: result.state,
+      report
+    });
+    toast({
+      title: 'GO 记录已接入对账',
+      description: `合并 ${report.merged}，并列差异 ${report.conflicts}，重复跳过 ${report.duplicated}`,
+      status: 'success',
+      duration: 2600
+    });
+  }
+
+  function addGoRecord(draft: Omit<GoRecord, 'id' | 'planId' | 'importedAt' | 'batchId'>) {
+    const scene = activePlan.scenes.find((item) => item.id === draft.sceneId);
+    if (scene?.frozen) {
+      toast({ title: '冻结场次不能写入', status: 'error' });
+      return;
+    }
+    const batchId = `manual-${Date.now().toString(36)}`;
+    const record: GoRecord = {
+      ...draft,
+      id: `GO-MANUAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      planId: activePlan.id,
+      importedAt: new Date().toISOString(),
+      batchId
+    };
+    const result = mergeGoRecords(workspace.reconciliation, workspace.plans, [record]);
+    if ('errors' in result) {
+      failImport(result.errors);
+      return;
+    }
+    dispatch({
+      type: 'reconcile',
+      label: '编程执行补录 GO 记录',
+      reconciliation: result.state,
+      report: { ...result.report, restored: false }
+    });
+  }
+
+  function confirmReconciliation(entryId: string, chosenRecordId?: string) {
+    const result = confirmEntry(workspace.reconciliation, workspace.plans, entryId, chosenRecordId, workspace.role);
+    if (result.error) {
+      toast({ title: result.error, status: 'warning' });
+      return;
+    }
+    dispatch({ type: 'reconcile', label: '舞台监督确认执行记录（保留计划快照）', reconciliation: result.state });
+    toast({ title: '已确认，确认前后均未改动全剧时间', status: 'success' });
+  }
+
+  function recalculateReconciliation(entryId: string) {
+    const result = recalculateEntry(workspace.reconciliation, workspace.plans, entryId);
+    if (result.error) {
+      toast({ title: result.error, status: 'warning' });
+      return;
+    }
+    dispatch({ type: 'reconcile', label: '失效执行记录已按当前计划重算', reconciliation: result.state });
+  }
+
+  function discardReconciliation(entryId: string) {
+    if (!window.confirm('丢弃该未确认条目？原始 GO 记录仍保留在执行记录中。')) return;
+    const next = discardEntry(workspace.reconciliation, entryId, workspace.role);
+    if (next === workspace.reconciliation) {
+      toast({ title: '当前角色不能丢弃，仅舞台监督或灯光设计可操作', status: 'warning' });
+      return;
+    }
+    dispatch({ type: 'reconcile', label: '丢弃未确认对账条目', reconciliation: next });
+  }
+
+  function selectReconciliationCue(sceneId: string, cueNumber: string) {
+    const scene = activePlan.scenes.find((item) => item.id === sceneId);
+    const cue = scene?.cues.find((item) => item.number === cueNumber);
+    if (scene && cue) {
+      dispatch({ type: 'selectCue', sceneId, cueId: cue.id });
+      setMode('design');
+    } else {
+      toast({ title: `提示 ${cueNumber} 在当前计划中已不存在`, status: 'warning' });
+    }
+  }
+
   function exportPlan() {
+    const planViews = selectPlanViews(workspace.reconciliation, workspace.plans, activePlan.id);
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
       conflicts: activeConflicts,
-      role: workspace.role
+      role: workspace.role,
+      reconciliation: {
+        entries: workspace.reconciliation.entries.filter((entry) => entry.planId === activePlan.id),
+        records: workspace.reconciliation.records.filter((record) => record.planId === activePlan.id),
+        views: planViews.map((view) => ({
+          entryId: view.id,
+          sceneId: view.sceneId,
+          cueNumber: view.cueNumber,
+          status: view.status,
+          effective: view.effective,
+          staleReason: view.staleReason,
+          sceneFrozen: view.sceneFrozen,
+          chosenRecordId: view.chosenRecordId,
+          confirmedAt: view.confirmedAt,
+          snapshot: view.snapshot,
+          records: view.records,
+          differences: view.diffs
+        }))
+      },
+      lastImportReport: workspace.lastImportReport
     };
     const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }));
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${activePlan.name}-灯光提示.json`;
+    anchor.download = `${activePlan.name}-灯光提示与执行对账.json`;
     anchor.click();
     URL.revokeObjectURL(url);
   }
@@ -827,6 +1018,31 @@ export default function App() {
               <Heading size="md" letterSpacing="wide">光影谱 · 灯光提示设计台</Heading>
               <Text color="whiteAlpha.500" fontSize="xs">场次编排、跟随关系、冲突核对与多方案比较</Text>
             </Box>
+            <ButtonGroup size="sm" isAttached variant="outline" ml={2}>
+              <Button
+                aria-pressed={mode === 'design'}
+                colorScheme={mode === 'design' ? 'amber' : 'whiteAlpha'}
+                variant={mode === 'design' ? 'solid' : 'outline'}
+                leftIcon={<ListChecks size={14} />}
+                onClick={() => setMode('design')}
+              >
+                方案编排
+              </Button>
+              <Button
+                aria-pressed={mode === 'reconcile'}
+                colorScheme={mode === 'reconcile' ? 'amber' : 'whiteAlpha'}
+                variant={mode === 'reconcile' ? 'solid' : 'outline'}
+                leftIcon={<ClipboardList size={14} />}
+                onClick={() => setMode('reconcile')}
+              >
+                执行对账
+                {reconciliationViews.some((view) => view.effective === 'pending' || view.effective === 'stale') ? (
+                  <Badge ml={1} colorScheme="red" borderRadius="full">
+                    {reconciliationViews.filter((view) => view.effective !== 'confirmed').length}
+                  </Badge>
+                ) : null}
+              </Button>
+            </ButtonGroup>
           </Flex>
 
           <HStack ml={{ base: 0, xl: 'auto' }} spacing={2} wrap="wrap">
@@ -896,6 +1112,22 @@ export default function App() {
         </Flex>
       </Box>
 
+      {mode === 'reconcile' ? (
+        <Box maxW="1280px" mx="auto" p={{ base: 3, xl: 5 }} w="full">
+          <ReconciliationPanel
+            plan={activePlan}
+            role={workspace.role}
+            views={reconciliationViews}
+            report={workspace.lastImportReport}
+            onImportRaw={importGoRaw}
+            onAddRecord={addGoRecord}
+            onConfirm={confirmReconciliation}
+            onRecalculate={recalculateReconciliation}
+            onDiscard={discardReconciliation}
+            onSelectCue={selectReconciliationCue}
+          />
+        </Box>
+      ) : (
       <Grid className="desk-grid" templateColumns={{ base: '1fr', xl: '286px minmax(0, 1fr) 380px' }} gap={4} p={{ base: 3, xl: 5 }} maxW="1920px" mx="auto">
         <Box as="aside" className="side-panel" position="sticky" top="104px" alignSelf="start" maxH="calc(100vh - 124px)" overflowY="auto" pr={1}>
           <VStack align="stretch" spacing={4}>
@@ -950,7 +1182,30 @@ export default function App() {
                   <Text color="whiteAlpha.500" fontSize="xs">当前方案冲突</Text>
                 </Box>
               </SimpleGrid>
-              <Button mt={3} w="full" colorScheme="blue" variant="outline" leftIcon={<SkipForward size={16} />} onClick={jumpIncomplete}>
+              <SimpleGrid columns={3} spacing={2} mt={2}>
+                <Box p={2} borderRadius="lg" bg="blackAlpha.200">
+                  <Text fontSize="lg" fontWeight="800" color="orange.300">
+                    {reconciliationViews.filter((view) => view.effective === 'pending').length}
+                  </Text>
+                  <Text color="whiteAlpha.500" fontSize="10px">对账待确认</Text>
+                </Box>
+                <Box p={2} borderRadius="lg" bg="blackAlpha.200">
+                  <Text fontSize="lg" fontWeight="800" color="red.300">
+                    {reconciliationViews.filter((view) => view.effective === 'stale').length}
+                  </Text>
+                  <Text color="whiteAlpha.500" fontSize="10px">失效待重算</Text>
+                </Box>
+                <Box p={2} borderRadius="lg" bg="blackAlpha.200">
+                  <Text fontSize="lg" fontWeight="800" color="green.300">
+                    {reconciliationViews.filter((view) => view.status === 'confirmed').length}
+                  </Text>
+                  <Text color="whiteAlpha.500" fontSize="10px">已确认</Text>
+                </Box>
+              </SimpleGrid>
+              <Button mt={3} w="full" colorScheme="purple" variant="outline" size="sm" leftIcon={<ClipboardList size={15} />} onClick={() => setMode('reconcile')}>
+                打开执行对账
+              </Button>
+              <Button mt={2} w="full" colorScheme="blue" variant="outline" leftIcon={<SkipForward size={16} />} onClick={jumpIncomplete}>
                 下一未完成 / 阻断项
               </Button>
             </Box>
@@ -967,7 +1222,7 @@ export default function App() {
             </Box>
 
             <Button variant="outline" leftIcon={<Copy size={16} />} onClick={duplicatePlan}>复制为新方案</Button>
-            <Button variant="ghost" leftIcon={<RefreshCw size={16} />} onClick={exportPlan}>导出当前方案 JSON</Button>
+            <Button variant="ghost" leftIcon={<RefreshCw size={16} />} onClick={exportPlan}>导出方案与执行对账 JSON</Button>
           </VStack>
         </Box>
 
@@ -1044,6 +1299,7 @@ export default function App() {
                 selectedCueId={workspace.selectedCueId}
                 canEdit={editable}
                 conflicts={activeConflicts}
+                reconciliationByCue={reconciliationByCue}
                 onSelect={(cueId) => selectCue(activeScene.id, cueId)}
                 onReorder={reorderCue}
               />
@@ -1139,9 +1395,10 @@ export default function App() {
           </Box>
         </Box>
       </Grid>
+      )}
 
       <Box as="footer" maxW="1920px" mx="auto" px={5} pb={7} color="whiteAlpha.400" fontSize="xs" textAlign="center">
-        所有方案与草稿保存在当前浏览器。清除站点数据会删除灯光设计台内容。
+        所有方案、草稿与执行对账记录均保存在当前浏览器。清除站点数据会删除灯光设计台内容。
       </Box>
     </Box>
   );

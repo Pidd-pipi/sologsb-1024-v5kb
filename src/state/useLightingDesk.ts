@@ -1,6 +1,7 @@
 import { useReducer } from 'react';
 import { recalculatePlans, samplePlans } from '../data';
-import type { Cue, EditorState, LightingPlan, Scene, UserRole, Workspace } from '../types';
+import { emptyReconciliation } from '../reconciliation';
+import type { Cue, EditorState, ImportReport, LightingPlan, ReconciliationState, Scene, UserRole, Workspace } from '../types';
 
 export const LIGHTING_STORAGE_KEY = 'sologsb-1024/lighting-cue-desk/v1';
 
@@ -16,7 +17,8 @@ export function createInitialWorkspace(): Workspace {
     comparePlanId: plans[1].id,
     selectedSceneId: plans[0].scenes[0].id,
     selectedCueId: plans[0].scenes[0].cues[0].id,
-    role: 'designer'
+    role: 'designer',
+    reconciliation: emptyReconciliation()
   };
 }
 
@@ -32,6 +34,12 @@ export function createInitialState(): EditorState {
 export type EditorAction =
   | { type: 'hydrate'; workspace: Workspace }
   | { type: 'commit'; label: string; mutate: (workspace: Workspace) => void }
+  | {
+      type: 'reconcile';
+      label: string;
+      reconciliation: ReconciliationState;
+      report?: ImportReport;
+    }
   | { type: 'selectScene'; sceneId: string }
   | { type: 'selectCue'; sceneId: string; cueId: string }
   | { type: 'selectPlan'; planId: string }
@@ -42,6 +50,7 @@ export type EditorAction =
 
 function normalizeWorkspace(workspace: Workspace) {
   recalculatePlans(workspace.plans);
+  if (!workspace.reconciliation) workspace.reconciliation = emptyReconciliation();
   const active = workspace.plans.find((plan) => plan.id === workspace.activePlanId) ?? workspace.plans[0];
   if (!active) return workspace;
   workspace.activePlanId = active.id;
@@ -72,6 +81,18 @@ export function lightingReducer(state: EditorState, action: EditorAction): Edito
       normalizeWorkspace(next);
       const active = next.plans.find((plan) => plan.id === next.activePlanId);
       if (active) active.updatedAt = new Date().toISOString();
+      return {
+        workspace: next,
+        past: [...state.past.slice(-49), clone(state.workspace)],
+        future: [],
+        lastAction: action.label
+      };
+    }
+    case 'reconcile': {
+      // 对账只写执行记录，不触碰计划时间线；合并失败的调用方不会派发此动作
+      const next = clone(state.workspace);
+      next.reconciliation = clone(action.reconciliation);
+      if (action.report) next.lastImportReport = clone(action.report);
       return {
         workspace: next,
         past: [...state.past.slice(-49), clone(state.workspace)],
@@ -166,6 +187,20 @@ export function canEditScene(role: UserRole, scene: Scene | undefined) {
 }
 
 export function canFreeze(role: UserRole) {
+  return role === 'designer' || role === 'stage-manager';
+}
+
+/** 编程执行只能补记录（导入/手动补 GO），不能确认 */
+export function canImportGo(role: UserRole) {
+  return role === 'designer' || role === 'programmer' || role === 'stage-manager';
+}
+
+/** 确认执行记录是舞台监督的专属职责 */
+export function canConfirmReconciliation(role: UserRole) {
+  return role === 'stage-manager';
+}
+
+export function canManageReconciliation(role: UserRole) {
   return role === 'designer' || role === 'stage-manager';
 }
 
